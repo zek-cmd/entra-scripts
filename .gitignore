@@ -1,0 +1,18 @@
+# --- Spreadsheets: never commit (real user data / tenant exports) ---
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.csv
+*.txt
+
+# --- Audit / run output ---
+# Contains real UPNs, DisplayNames and Entra object IDs.
+Output Report/
+*.log
+
+# --- OS / editor noise ---
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp

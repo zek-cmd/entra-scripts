@@ -11,6 +11,7 @@ A set of Windows PowerShell scripts for managing Microsoft Entra ID (Azure AD) u
 | `add_or_move_Entra-Users.ps1` | Adds users from an Excel file to a group, or moves them from one group to another. |
 | `Remove-Entra-Licenses.ps1` | Removes licenses from the users listed in an Excel file. |
 | `Bulk-Delete-Entra-Users.ps1` | Deletes users and strips their licenses. Users come from an Excel file or from a group, and are always limited to a chosen group. |
+| `Find-Duplicate-Entra-Names.ps1` | Read-only scan of all users for duplicate or near-duplicate names (for example "Jon Smith" and "John Smith"). Changes nothing. Saves a CSV report to the `Output Report` folder. |
 | `Resolve-PythonWithOpenpyxl.ps1` | Shared helper. Finds a Python install that has `openpyxl`, used to read Excel files. Not run on its own. |
 
 Scripts write CSV reports to the `Output Report` folder.

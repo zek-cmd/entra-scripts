@@ -338,6 +338,35 @@ function Resolve-EntraUser {
     return @()
 }
 
+function ConvertTo-NameTokens {
+    param([string]$Text)
+    return @((([string]$Text).ToLowerInvariant() -replace '[^\p{L}\p{N}]+', ' ') -split ' ' | Where-Object { $_ })
+}
+
+function Get-CloseNameMatches {
+    <# Suggests users whose display name shares words with $Value. Used only to
+       report candidates for NotFound names - it never changes who is moved. #>
+    param([string]$Value, [string]$Provider)
+    if (-not $script:AllUsersCache) {
+        if ($Provider -eq 'Graph') {
+            $script:AllUsersCache = @(Get-MgUser -All -Property @('Id', 'DisplayName', 'UserPrincipalName') -ErrorAction SilentlyContinue | Select-Object Id, DisplayName, UserPrincipalName)
+        } else {
+            $script:AllUsersCache = @(Get-AzureADUser -All $true -ErrorAction SilentlyContinue | Select-Object @{N = 'Id'; E = { $_.ObjectId }}, DisplayName, UserPrincipalName)
+        }
+    }
+    $inTok = @(ConvertTo-NameTokens -Text $Value | Select-Object -Unique)
+    if ($inTok.Count -eq 0) { return @() }
+    $scored = foreach ($u in $script:AllUsersCache) {
+        $cTok = @(ConvertTo-NameTokens -Text $u.DisplayName | Select-Object -Unique)
+        if ($cTok.Count -eq 0) { continue }
+        $shared = @($inTok | Where-Object { $cTok -contains $_ }).Count
+        if ($shared -eq 0) { continue }
+        $union = @(@($inTok) + @($cTok) | Select-Object -Unique).Count
+        [pscustomobject]@{ Id = $u.Id; Name = $u.DisplayName; Upn = $u.UserPrincipalName; Score = [math]::Round($shared / $union, 2) }
+    }
+    return @($scored | Where-Object { $_.Score -ge 0.5 } | Sort-Object Score -Descending | Select-Object -First 5)
+}
+
 function Get-UserId {
     param($User, [string]$Provider)
     if ($Provider -eq 'Graph') { return $User.Id }
@@ -677,8 +706,36 @@ foreach ($item in $userList) {
     } else {
         $users = @(Resolve-EntraUser -Value $value -Type $IdentifierType -Provider $provider)
     }
-    if ($users.Count -eq 0) { $stats.NotFound++; Write-Host (" NOT FOUND  : {0}" -f $value) -ForegroundColor DarkYellow; Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -UserId '' -FromGroup $fromGroupName -ToGroup $toGroup.DisplayName -Result 'NotFound' -Message 'No matching Entra user'; continue }
-    if ($users.Count -gt 1) { Write-Warning (" Ambiguous: '{0}' matched {1} users. Skipping." -f $value, $users.Count); continue }
+    if ($users.Count -eq 0) {
+        $close = @()
+        if ($IdentifierType -ne 'ObjectId') { $close = @(Get-CloseNameMatches -Value $value -Provider $provider) }
+        Write-Host (" NOT FOUND  : {0}" -f $value) -ForegroundColor DarkYellow
+        if ($close.Count -gt 0) {
+            Write-Host ' Closest matches:' -ForegroundColor Cyan
+            $n = 0
+            foreach ($c in $close) {
+                $n++
+                Write-Host ("   [{0}] {1}  ({2})  score {3}" -f $n, $c.Name, $c.Upn, $c.Score) -ForegroundColor Gray
+            }
+            $pick = (Read-Host '   Enter number to use that user, or press Enter to skip').Trim()
+            if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $close.Count) {
+                $chosen = $close[[int]$pick - 1]
+                $users = @(Resolve-EntraUser -Value $chosen.Id -Type 'ObjectId' -Provider $provider)
+                if ($users.Count -eq 1) {
+                    Write-Host (" PICKED    : {0}" -f $chosen.Name) -ForegroundColor Cyan
+                    Write-Log -Action 'Resolve' -Identifier $value -DisplayName $chosen.Name -UserId $chosen.Id -FromGroup $fromGroupName -ToGroup $toGroup.DisplayName -Result 'PickedClosest' -Message ("Chosen by operator from close match (score {0})" -f $chosen.Score)
+                }
+            }
+        }
+        if ($users.Count -eq 0) {
+            $stats.NotFound++
+            $closeText = if ($close.Count -gt 0) { ($close | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Score }) -join '; ' } else { 'none' }
+            Write-Host (" closest    : {0}" -f $closeText) -ForegroundColor DarkGray
+            Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -UserId '' -FromGroup $fromGroupName -ToGroup $toGroup.DisplayName -Result 'NotFound' -Message ("No exact match. Closest: {0}" -f $closeText)
+            continue
+        }
+    }
+    if ($users.Count -gt 1) { Write-Warning (" Ambiguous: '{0}' matched {1} users. Skipping." -f $value, $users.Count); Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -UserId '' -FromGroup $fromGroupName -ToGroup $toGroup.DisplayName -Result 'Ambiguous' -Message ("Matched {0} users. Skipped." -f $users.Count); continue }
 
     $user = $users[0]
     $oid = Get-UserId -User $user -Provider $provider

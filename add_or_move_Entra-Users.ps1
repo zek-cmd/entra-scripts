@@ -110,7 +110,8 @@ function Write-Log {
     )
     $line = @(
         $Action, $Identifier, $DisplayName, $UserId, $FromGroup, $ToGroup, $Result,
-        ($Message -replace "`r|`n", ' '), (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        (($Message -replace "`r|`n", ' ') + $(if ($null -ne $script:LastMatchScore -and "$($script:LastMatchScore)" -ne '') { " [score $($script:LastMatchScore)%]" } else { '' })),
+        (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     ) -join '","'
     $line = '"' + $line + '"'
     $enc = New-Object System.Text.UTF8Encoding($true)
@@ -362,9 +363,36 @@ function Get-CloseNameMatches {
         $shared = @($inTok | Where-Object { $cTok -contains $_ }).Count
         if ($shared -eq 0) { continue }
         $union = @(@($inTok) + @($cTok) | Select-Object -Unique).Count
-        [pscustomobject]@{ Id = $u.Id; Name = $u.DisplayName; Upn = $u.UserPrincipalName; Score = [math]::Round($shared / $union, 2) }
+        [pscustomobject]@{ Id = $u.Id; Name = $u.DisplayName; Upn = $u.UserPrincipalName; Score = [int][math]::Round(100 * $shared / $union) }
     }
-    return @($scored | Where-Object { $_.Score -ge 0.5 } | Sort-Object Score -Descending | Select-Object -First 5)
+    return @($scored | Where-Object { $_.Score -ge 50 } | Sort-Object Score -Descending | Select-Object -First 5)
+}
+
+function Get-MatchScore {
+    <# Returns a 0-100 match score for the Entra user against the spreadsheet
+       value, plus close-name candidates when nothing resolved. Read-only: it
+       never changes who gets moved. #>
+    param([string]$Value, [object[]]$Users, [string]$Type, [string]$Provider)
+
+    $result = [pscustomobject]@{ Score = 100; Method = $Type; CloseMatches = @() }
+    if ($Type -eq 'ObjectId') { return $result }
+
+    $exact = @($Users | Where-Object { $_ })
+    if ($exact.Count -ge 1) {
+        $u = $exact[0]
+        $val = ([string]$Value).Trim()
+        if ($Type -eq 'UPN') {
+            $result.Score = if ([string]::Equals([string]$u.UserPrincipalName, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 70 }
+        } elseif ($Type -eq 'Mail') {
+            $result.Score = if ([string]::Equals([string]$u.Mail, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 70 }
+        } else {
+            $result.Score = if ([string]::Equals([string]$u.DisplayName, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 80 }
+        }
+        return $result
+    }
+
+    $result.CloseMatches = @(Get-CloseNameMatches -Value $Value -Provider $Provider)
+    return $result
 }
 
 function Get-UserId {
@@ -699,6 +727,7 @@ $stats = [ordered]@{ Resolved=0; Moved=0; AddedOnly=0; Skipped=0; NotFound=0; Fa
 
 foreach ($item in $userList) {
     $value = $item.Identifier
+    $script:LastMatchScore = ''
     $userObj = $item.UserObj
     $users = @()
     if ($userObj) {
@@ -740,6 +769,11 @@ foreach ($item in $userList) {
     $user = $users[0]
     $oid = Get-UserId -User $user -Provider $provider
     $disp = Get-UserDisplay -User $user
+    # How strongly this user answers the spreadsheet row (0-100).
+    $matchType = if ($userObj) { 'ObjectId' } else { $IdentifierType }
+    $match = Get-MatchScore -Value $value -Users $users -Type $matchType -Provider $provider
+    $script:LastMatchScore = [int]$match.Score
+    Write-Host (" MATCH {0,3}% : {1}  ({2})" -f [int]$match.Score, $disp, $matchType) -ForegroundColor DarkGray
     # Never leave the audit line blank: fall back to the identifier, then the id.
     if ([string]::IsNullOrWhiteSpace($disp)) {
         $disp = if (-not [string]::IsNullOrWhiteSpace($value)) { $value } else { [string]$oid }

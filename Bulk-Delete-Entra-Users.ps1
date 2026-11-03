@@ -16,6 +16,9 @@
       * -Confirm        -> interactive prompt before each delete.
       * -DisableOnly    -> disable accounts instead of deleting them (reversible).
       * License cleanup -> removes assigned licenses first, so deletes do not fail.
+      * Match score     -> every resolved user is scored 0-100 against the row and
+                           skipped when the score is below -MinMatchScore (default 60),
+                           so a lookalike name is never deleted by accident.
       * Audit log       -> appends a CSV log of every action attempted.
 
     Works with either the modern Microsoft.Graph module or the legacy AzureAD module.
@@ -40,6 +43,11 @@
 
 .PARAMETER SkipLicenseCleanup
     Do not remove licenses before deleting. Faster, but deletes may fail for licensed users.
+
+.PARAMETER MinMatchScore
+    Lowest match score (0-100) allowed for a delete. A user resolved by
+    DisplayName or Mail that scores below this is skipped and logged as
+    LowScore instead of deleted. Default 60. Object id lookups always score 100.
 
 .PARAMETER GroupName
     Display name of the group that scopes the delete. Only members of this group
@@ -93,6 +101,9 @@ param(
 
     [switch]$SkipLicenseCleanup,
 
+    [ValidateRange(0, 100)]
+    [int]$MinMatchScore = 60,
+
     [string]$GroupName,
 
     [ValidateSet('Excel', 'Group')]
@@ -142,12 +153,13 @@ function Write-Log {
         ObjectId    = $ObjectId
         Group       = if ($Group) { $Group } else { $script:ScopeGroupName }
         Result      = $Result
+        Score       = $script:LastMatchScore
         Message     = $Message
     }
     # Written via .NET so -WhatIf does not suppress the audit trail.
     $fields = @(
         $row.Timestamp, $row.Action, $row.Identifier, $row.DisplayName,
-        $row.ObjectId, $row.Group, $row.Result, ($row.Message -replace "`r|`n", ' ')
+        $row.ObjectId, $row.Group, $row.Result, $row.Score, ($row.Message -replace "`r|`n", ' ')
     ) | ForEach-Object { '"{0}"' -f ([string]$_ -replace '"', '""') }
 
     $line = ($fields -join ',') + [Environment]::NewLine
@@ -159,7 +171,7 @@ function Write-Log {
     if (Test-Path -LiteralPath $script:LogFile) {
         [System.IO.File]::AppendAllText($script:LogFile, $line, $enc)
     } else {
-        $header = '"Timestamp","Action","Identifier","DisplayName","ObjectId","Group","Result","Message"' + [Environment]::NewLine
+        $header = '"Timestamp","Action","Identifier","DisplayName","ObjectId","Group","Result","MatchScore","Message"' + [Environment]::NewLine
         [System.IO.File]::WriteAllText($script:LogFile, $header + $line, $enc)
     }
 }
@@ -383,6 +395,81 @@ function Resolve-EntraUser {
         }
     }
     return @()
+}
+
+# ---------------------------------------------------------------------------
+# Match scoring helpers
+#
+# Every resolved user is scored 0-100 against the value in the spreadsheet, so
+# the console and the audit log say how strong each match was. A delete is
+# permanent, so a DisplayName/Mail match below -MinMatchScore is skipped
+# instead of removed - that is what backs out a lookalike name on a bad row.
+# Score is inert for ObjectId lookups: an id either exists or it does not.
+# ---------------------------------------------------------------------------
+function ConvertTo-NameTokens {
+    param([string]$Text)
+    return @((([string]$Text).ToLowerInvariant() -replace '[^\p{L}\p{N}]+', ' ') -split ' ' | Where-Object { $_ })
+}
+
+function Get-MatchScore {
+    <# Returns a 0-100 match score for the Entra user against the spreadsheet
+       value, the strategy that produced it, and the close-name candidates when
+       nothing resolved. Read-only: it never changes who gets touched. #>
+    param([string]$Value, [object[]]$Users, [string]$Type, [string]$Provider)
+
+    $result = [pscustomobject]@{ Score = 100; Method = $Type; CloseMatches = @() }
+    if ($Type -eq 'ObjectId') { return $result }
+
+    $exact = @($Users | Where-Object { $_ })
+    if ($exact.Count -ge 1) {
+        $u = $exact[0]
+        $val = ([string]$Value).Trim()
+        if ($Type -eq 'UPN') {
+            $result.Score = if ([string]::Equals([string]$u.UserPrincipalName, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 70 }
+        } elseif ($Type -eq 'Mail') {
+            $result.Score = if ([string]::Equals([string]$u.Mail, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 70 }
+        } else {
+            $result.Score = if ([string]::Equals([string]$u.DisplayName, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 80 }
+        }
+        return $result
+    }
+
+    # Nothing resolved - suggest the closest names so a typo can be seen.
+    $all = @(Get-ScoredDirectoryUsers -Provider $Provider)
+    $inTok = @(ConvertTo-NameTokens -Text $Value | Select-Object -Unique)
+    if ($inTok.Count -eq 0 -or $all.Count -eq 0) { return $result }
+
+    $scored = foreach ($u in $all) {
+        $cTok = @(ConvertTo-NameTokens -Text $u.DisplayName | Select-Object -Unique)
+        if ($cTok.Count -eq 0) { continue }
+        $shared = @($inTok | Where-Object { $cTok -contains $_ }).Count
+        if ($shared -eq 0) { continue }
+        $union = @(@($inTok) + @($cTok) | Select-Object -Unique).Count
+        [pscustomobject]@{ Id = $u.Id; Name = $u.DisplayName; Upn = $u.UserPrincipalName; Score = [math]::Round($shared / $union, 2) }
+    }
+    $result.CloseMatches = @($scored | Where-Object { $_.Score -ge 0.5 } | Sort-Object Score -Descending | Select-Object -First 5)
+    return $result
+}
+
+function Get-ScoredDirectoryUsers {
+    <# Cached directory list (id, display name, UPN) used only for close-name
+       suggestions. Loaded once per run. #>
+    param([string]$Provider)
+    if ($script:AllUsersCache) { return $script:AllUsersCache }
+    if ($Provider -eq 'Graph') {
+        $script:AllUsersCache = @(Get-MgUser -All -Property @('Id', 'DisplayName', 'UserPrincipalName') -ErrorAction SilentlyContinue |
+            Select-Object Id, DisplayName, UserPrincipalName)
+    } else {
+        $script:AllUsersCache = @(Get-AzureADUser -All $true -ErrorAction SilentlyContinue |
+            Select-Object @{N = 'Id'; E = { $_.ObjectId }}, DisplayName, UserPrincipalName)
+    }
+    return $script:AllUsersCache
+}
+
+function Format-CloseMatches {
+    param($Matches)
+    if (-not $Matches -or @($Matches).Count -eq 0) { return 'none' }
+    return (@($Matches | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Score }) -join '; ')
 }
 
 function Remove-UserLicenses {
@@ -870,11 +957,12 @@ if ($useExcel) {
 Write-Host (" Rows to process : {0}" -f $values.Count)
 Write-Host '--------------------------------------------------'
 
-$stats = [ordered]@{ Resolved = 0; Deleted = 0; Disabled = 0; NotFound = 0; Ambiguous = 0; NotInGroup = 0; Failed = 0; Skipped = 0 }
+$stats = [ordered]@{ Resolved = 0; Deleted = 0; Disabled = 0; NotFound = 0; Ambiguous = 0; NotInGroup = 0; LowScore = 0; Failed = 0; Skipped = 0 }
 $index = 0
 
 foreach ($value in $values) {
     $index++
+    $script:LastMatchScore = ''
 
     if ($useExcel) {
         $users = @(Resolve-EntraUser -Value $value -Type $IdentifierType -Provider $provider)
@@ -887,8 +975,13 @@ foreach ($value in $values) {
 
     if ($users.Count -eq 0) {
         $stats.NotFound++
-        Write-Host ("[{0,3}/{1}] NOT FOUND  : {2}" -f $index, $values.Count, $value) -ForegroundColor DarkYellow
-        Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -ObjectId '' -Result 'NotFound' -Message 'No matching Entra user'
+        $miss = Get-MatchScore -Value $value -Users @() -Type $(if ($useExcel) { $IdentifierType } else { 'ObjectId' }) -Provider $provider
+        $closeText = Format-CloseMatches -Matches $miss.CloseMatches
+        Write-Host ("[{0,3}/{1}] NOT FOUND  : {2}  (score 0)" -f $index, $values.Count, $value) -ForegroundColor DarkYellow
+        if ($closeText -ne 'none') {
+            Write-Host ("             closest: {0}" -f $closeText) -ForegroundColor DarkGray
+        }
+        Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -ObjectId '' -Result 'NotFound' -Message ("No matching Entra user (score 0). Closest: {0}" -f $closeText)
         continue
     }
 
@@ -899,13 +992,30 @@ foreach ($value in $values) {
         continue
     }
 
-    $user = $users[0]
-    $oid = Get-UserId -User $user -Provider $provider
-    $disp = Get-UserDisplay -User $user
+    $u = $users[0]
+    $oid = Get-UserId -User $u -Provider $provider
+    $disp = Get-UserDisplay -User $u
     # Never leave the audit line blank: fall back to the identifier, then the id.
     if ([string]::IsNullOrWhiteSpace($disp)) {
         $disp = if (-not [string]::IsNullOrWhiteSpace($value)) { $value } else { [string]$oid }
     }
+
+    # --- Match score -------------------------------------------------------
+    # How strongly this user answers the spreadsheet row. Group mode resolves
+    # by object id, so it scores 100 and is never held back by this check.
+    $matchType = if ($useExcel) { $IdentifierType } else { 'ObjectId' }
+    $match = Get-MatchScore -Value $value -Users $users -Type $matchType -Provider $provider
+    $score = [int]$match.Score
+    $script:LastMatchScore = $score
+    Write-Host ("[{0,3}/{1}] MATCH {2,3}% : {3}  ({4})" -f $index, $values.Count, $score, $disp, $matchType) -ForegroundColor DarkGray
+
+    if ($score -lt $MinMatchScore) {
+        $stats.LowScore++
+        Write-Host ("[{0,3}/{1}] LOW SCORE : {2} scored {3}% (minimum {4}%) - skipped" -f $index, $values.Count, $disp, $score, $MinMatchScore) -ForegroundColor Yellow
+        Write-Log -Action 'Resolve' -Identifier $value -DisplayName $disp -ObjectId $oid -Result 'LowScore' -Message ("Match score {0}% is below the -MinMatchScore limit of {1}%" -f $score, $MinMatchScore)
+        continue
+    }
+
     $stats.Resolved++
 
     # --- Group scope enforcement (Excel source only) ------------------------
@@ -920,7 +1030,7 @@ foreach ($value in $values) {
     }
 
     if ($DisableOnly) {
-        if ($PSCmdlet.ShouldProcess($disp, "Disable account (UPN: $($user.UserPrincipalName))")) {
+        if ($PSCmdlet.ShouldProcess($disp, "Disable account (UPN: $($u.UserPrincipalName))")) {
             try {
                 if ($provider -eq 'Graph') { Update-MgUser -UserId $oid -AccountEnabled:$false -ErrorAction Stop }
                 else { Set-AzureADUser -ObjectId $oid -AccountEnabled $false -ErrorAction Stop }
@@ -941,7 +1051,7 @@ foreach ($value in $values) {
     }
 
     # DELETE path
-    if ($PSCmdlet.ShouldProcess($disp, "DELETE account (UPN: $($user.UserPrincipalName))")) {
+    if ($PSCmdlet.ShouldProcess($disp, "DELETE account (UPN: $($u.UserPrincipalName))")) {
         try {
             if (-not $SkipLicenseCleanup) { Remove-UserLicenses -User $user -Provider $provider }
             if ($provider -eq 'Graph') { Remove-MgUser -UserId $oid -ErrorAction Stop }
@@ -971,6 +1081,7 @@ Write-Host (" Disabled  : {0}" -f $stats.Disabled)
 Write-Host (" NotFound  : {0}" -f $stats.NotFound)
 Write-Host (" Ambiguous : {0}" -f $stats.Ambiguous)
 Write-Host (" NotInGroup: {0}" -f $stats.NotInGroup)
+Write-Host (" LowScore  : {0}  (below -MinMatchScore {1}%)" -f $stats.LowScore, $MinMatchScore)
 Write-Host (" Failed    : {0}" -f $stats.Failed)
 Write-Host (" WhatIf    : {0}" -f $stats.Skipped)
 Write-Host (" Audit log : {0}" -f $LogPath)

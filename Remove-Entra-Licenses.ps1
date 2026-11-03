@@ -47,7 +47,8 @@ function Write-Log {
     param([string]$Action, [string]$Identifier, [string]$DisplayName, [string]$UserId,
           [string]$Sku, [string]$Result, [string]$Message)
     $line = @($Action, $Identifier, $DisplayName, $UserId, $Sku, $Result,
-        ($Message -replace "`r|`n", ' '), (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) -join '","'
+        (($Message -replace "`r|`n", ' ') + $(if ($null -ne $script:LastMatchScore -and "$($script:LastMatchScore)" -ne '') { " [score $($script:LastMatchScore)%]" } else { '' })),
+        (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) -join '","'
     $line = '"' + $line + '"'
     $enc = New-Object System.Text.UTF8Encoding($true)
     [System.IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, $enc)
@@ -261,6 +262,67 @@ function Resolve-EntraUser {
         }
     }
     return @()
+}
+
+# ---------------------------------------------------------------------------
+# Match scoring helpers (same scoring the delete script uses)
+# ---------------------------------------------------------------------------
+function ConvertTo-NameTokens {
+    param([string]$Text)
+    return @((([string]$Text).ToLowerInvariant() -replace '[^\p{L}\p{N}]+', ' ') -split ' ' | Where-Object { $_ })
+}
+
+function Get-ScoredDirectoryUsers {
+    <# Cached directory list (id, display name, UPN) used only for close-name
+       suggestions. Loaded once per run. #>
+    param([string]$Provider)
+    if ($script:AllUsersCache) { return $script:AllUsersCache }
+    if ($Provider -eq 'Graph') {
+        $script:AllUsersCache = @(Get-MgUser -All -Property @('Id', 'DisplayName', 'UserPrincipalName') -ErrorAction SilentlyContinue |
+            Select-Object Id, DisplayName, UserPrincipalName)
+    } else {
+        $script:AllUsersCache = @(Get-AzureADUser -All $true -ErrorAction SilentlyContinue |
+            Select-Object @{N = 'Id'; E = { $_.ObjectId }}, DisplayName, UserPrincipalName)
+    }
+    return $script:AllUsersCache
+}
+
+function Get-MatchScore {
+    <# Returns a 0-100 match score for the Entra user against the spreadsheet
+       value, plus close-name candidates when nothing resolved. #>
+    param([string]$Value, [object[]]$Users, [string]$Type, [string]$Provider)
+
+    $result = [pscustomobject]@{ Score = 100; Method = $Type; CloseMatches = @() }
+    if ($Type -eq 'ObjectId') { return $result }
+
+    $exact = @($Users | Where-Object { $_ })
+    if ($exact.Count -ge 1) {
+        $u = $exact[0]
+        $val = ([string]$Value).Trim()
+        if ($Type -eq 'UPN') {
+            $result.Score = if ([string]::Equals([string]$u.UserPrincipalName, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 70 }
+        } elseif ($Type -eq 'Mail') {
+            $result.Score = if ([string]::Equals([string]$u.Mail, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 70 }
+        } else {
+            $result.Score = if ([string]::Equals([string]$u.DisplayName, $val, [StringComparison]::OrdinalIgnoreCase)) { 100 } else { 80 }
+        }
+        return $result
+    }
+
+    $all = @(Get-ScoredDirectoryUsers -Provider $Provider)
+    $inTok = @(ConvertTo-NameTokens -Text $Value | Select-Object -Unique)
+    if ($inTok.Count -eq 0 -or $all.Count -eq 0) { return $result }
+
+    $scored = foreach ($u in $all) {
+        $cTok = @(ConvertTo-NameTokens -Text $u.DisplayName | Select-Object -Unique)
+        if ($cTok.Count -eq 0) { continue }
+        $shared = @($inTok | Where-Object { $cTok -contains $_ }).Count
+        if ($shared -eq 0) { continue }
+        $union = @(@($inTok) + @($cTok) | Select-Object -Unique).Count
+        [pscustomobject]@{ Id = $u.Id; Name = $u.DisplayName; Upn = $u.UserPrincipalName; Score = [int][math]::Round(100 * $shared / $union) }
+    }
+    $result.CloseMatches = @($scored | Where-Object { $_.Score -ge 50 } | Sort-Object Score -Descending | Select-Object -First 5)
+    return $result
 }
 
 function Get-UserId {
@@ -541,6 +603,7 @@ if ($scope -eq '3') {
 $stats = [ordered]@{ Processed=0; Removed=0; NoLicense=0; NotFound=0; Failed=0; WhatIf=0 }
 
 foreach ($t in $targets) {
+    $script:LastMatchScore = ''
     # Resolve user object (reuse cached Id when available)
     $userObj = @()
     if ($t.Id) {
@@ -554,14 +617,25 @@ foreach ($t in $targets) {
     if ($u) {
         $oid = Get-UserId -User $u -Provider $provider
         $disp = Get-UserDisplay -User $u
+        # How strongly this user answers the row (0-100). A pre-seeded id scores 100.
+        $matchType = if ($t.Id) { 'ObjectId' } else { $IdentifierType }
+        $match = Get-MatchScore -Value $t.Identifier -Users @($u) -Type $matchType -Provider $provider
+        $script:LastMatchScore = [int]$match.Score
+        Write-Host (" MATCH {0,3}% : {1}  ({2})" -f [int]$match.Score, $disp, $matchType) -ForegroundColor DarkGray
         $t.Id = $oid; $t.Display = $disp
     } elseif ($t.Id) {
         $oid = $t.Id
         $disp = if ($t.Display) { $t.Display } else { $t.Identifier }
     } else {
         $stats.NotFound++
+        $closeText = 'none'
+        if ($IdentifierType -ne 'ObjectId') {
+            $miss = Get-MatchScore -Value $t.Identifier -Users @() -Type $IdentifierType -Provider $provider
+            $closeText = if (@($miss.CloseMatches).Count -gt 0) { (@($miss.CloseMatches | ForEach-Object { '{0} ({1}%)' -f $_.Name, $_.Score }) -join '; ') } else { 'none' }
+        }
         Write-Host (" NOT FOUND : {0}" -f $t.Identifier) -ForegroundColor DarkYellow
-        Write-Log -Action 'Resolve' -Identifier $t.Identifier -DisplayName '' -UserId '' -Sku '' -Result 'NotFound' -Message 'No matching Entra user'
+        if ($closeText -ne 'none') { Write-Host ("  closest  : {0}" -f $closeText) -ForegroundColor DarkGray }
+        Write-Log -Action 'Resolve' -Identifier $t.Identifier -DisplayName '' -UserId '' -Sku '' -Result 'NotFound' -Message ("No matching Entra user. Closest: {0}" -f $closeText)
         continue
     }
     $stats.Processed++

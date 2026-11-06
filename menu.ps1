@@ -9,12 +9,13 @@ Write-Host '[2] Bulk delete users (Bulk-Delete-Entra-Users.ps1, Excel or group)'
 Write-Host '[3] Bulk create users (bulk_create_user.ps1)' -ForegroundColor Gray
 Write-Host '[4] Remove licenses (Remove-Entra-Licenses.ps1)' -ForegroundColor Gray
 Write-Host '[5] Find duplicate or near-duplicate names (Find-Duplicate-Entra-Names.ps1, read-only)' -ForegroundColor Gray
-Write-Host '[6] Exit' -ForegroundColor DarkGray
+Write-Host '[6] Set department "Provision Fix" on one user (Set-Entra-UserDepartment.ps1)' -ForegroundColor Gray
+Write-Host '[7] Exit' -ForegroundColor DarkGray
 Write-Host ''
 
-$choice = (Read-Host 'Select number (1-6)').Trim()
-if ($choice -eq '6' -or $choice -eq '') { Write-Host 'Exiting.'; exit 0 }
-if ($choice -notin @('1','2','3','4','5')) { Write-Host 'Invalid selection. Exiting.' -ForegroundColor Red; exit 1 }
+$choice = (Read-Host 'Select number (1-7)').Trim()
+if ($choice -eq '7' -or $choice -eq '') { Write-Host 'Exiting.'; exit 0 }
+if ($choice -notin @('1','2','3','4','5','6')) { Write-Host 'Invalid selection. Exiting.' -ForegroundColor Red; exit 1 }
 
 # Option 5 only reads data, so it skips the dry-run question
 if ($choice -eq '5') {
@@ -39,6 +40,7 @@ switch ($choice) {
     '1' { & (Join-Path $PSScriptRoot 'add_or_move_Entra-Users.ps1') }
     '2' { & (Join-Path $PSScriptRoot 'Bulk-Delete-Entra-Users.ps1') }
     '4' { & (Join-Path $PSScriptRoot 'Remove-Entra-Licenses.ps1') }
+    '6' { & (Join-Path $PSScriptRoot 'Set-Entra-UserDepartment.ps1') }
     # This one declares an explicit [switch]$WhatIf -> must pass the argument
     '3' {
         if ($WhatIfPreference) { & (Join-Path $PSScriptRoot 'bulk_create_user.ps1') -WhatIf }

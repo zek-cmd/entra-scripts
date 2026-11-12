@@ -19,6 +19,9 @@
       * Match score     -> every resolved user is scored 0-100 against the row and
                            skipped when the score is below -MinMatchScore (default 60),
                            so a lookalike name is never deleted by accident.
+      * Close matches   -> when a row matches no user, the closest names are
+                           numbered and the operator can pick one (Enter = skip).
+                           A picked user is confirmed by id, so it passes the score check.
       * Audit log       -> appends a CSV log of every action attempted.
 
     Works with either the modern Microsoft.Graph module or the legacy AzureAD module.
@@ -470,6 +473,25 @@ function Format-CloseMatches {
     param($Matches)
     if (-not $Matches -or @($Matches).Count -eq 0) { return 'none' }
     return (@($Matches | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Score }) -join '; ')
+}
+
+function Select-CloseMatch {
+    <# Shows the numbered close-name candidates for one unresolved row and returns
+       the candidate the operator picks, or $null when the prompt is skipped with
+       Enter. Mirrors the picker in add_or_move_Entra-Users.ps1. #>
+    param([object[]]$Matches, [string]$Value)
+    $list = @($Matches | Where-Object { $_ })
+    if ($list.Count -eq 0) { return $null }
+    Write-Host '             Closest matches:' -ForegroundColor Cyan
+    for ($n = 0; $n -lt $list.Count; $n++) {
+        $c = $list[$n]
+        Write-Host ("               [{0}] {1}  ({2})  score {3}" -f ($n + 1), $c.Name, $c.Upn, $c.Score) -ForegroundColor Gray
+    }
+    $pick = (Read-Host ("             Enter number to use that user, or press Enter to skip '{0}'" -f $Value)).Trim()
+    if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $list.Count) {
+        return $list[[int]$pick - 1]
+    }
+    return $null
 }
 
 function Remove-UserLicenses {
@@ -963,6 +985,7 @@ $index = 0
 foreach ($value in $values) {
     $index++
     $script:LastMatchScore = ''
+    $picked = $false
 
     if ($useExcel) {
         $users = @(Resolve-EntraUser -Value $value -Type $IdentifierType -Provider $provider)
@@ -974,15 +997,38 @@ foreach ($value in $values) {
     }
 
     if ($users.Count -eq 0) {
-        $stats.NotFound++
         $miss = Get-MatchScore -Value $value -Users @() -Type $(if ($useExcel) { $IdentifierType } else { 'ObjectId' }) -Provider $provider
-        $closeText = Format-CloseMatches -Matches $miss.CloseMatches
+        $close = @($miss.CloseMatches)
+        $closeText = Format-CloseMatches -Matches $close
         Write-Host ("[{0,3}/{1}] NOT FOUND  : {2}  (score 0)" -f $index, $values.Count, $value) -ForegroundColor DarkYellow
         if ($closeText -ne 'none') {
             Write-Host ("             closest: {0}" -f $closeText) -ForegroundColor DarkGray
         }
-        Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -ObjectId '' -Result 'NotFound' -Message ("No matching Entra user (score 0). Closest: {0}" -f $closeText)
-        continue
+
+        # --- Close-match picker (Excel source only) -------------------------
+        # Nothing resolved. Offer the closest names by number so the operator can
+        # confirm the intended user instead of silently dropping the row. Pressing
+        # Enter skips the row, exactly as before this prompt existed.
+        $chosen = $null
+        if ($useExcel -and $IdentifierType -ne 'ObjectId' -and $close.Count -gt 0) {
+            $chosen = Select-CloseMatch -Matches $close -Value $value
+        }
+        if ($chosen) {
+            $users = @(Resolve-EntraUser -Value $chosen.Id -Type 'ObjectId' -Provider $provider)
+            if ($users.Count -eq 1) {
+                $picked = $true
+                $script:LastMatchScore = [int]$chosen.Score
+                Write-Host ("[{0,3}/{1}] PICKED     : {2}  (chosen from close match, score {3})" -f $index, $values.Count, $chosen.Name, $chosen.Score) -ForegroundColor Cyan
+                Write-Log -Action 'Resolve' -Identifier $value -DisplayName $chosen.Name -ObjectId $chosen.Id -Result 'PickedClosest' -Message ("Chosen by operator from close match (score {0})" -f $chosen.Score)
+            } else {
+                $users = @()
+            }
+        }
+        if ($users.Count -eq 0) {
+            $stats.NotFound++
+            Write-Log -Action 'Resolve' -Identifier $value -DisplayName '' -ObjectId '' -Result 'NotFound' -Message ("No matching Entra user (score 0). Closest: {0}" -f $closeText)
+            continue
+        }
     }
 
     if ($users.Count -gt 1) {
@@ -1003,7 +1049,9 @@ foreach ($value in $values) {
     # --- Match score -------------------------------------------------------
     # How strongly this user answers the spreadsheet row. Group mode resolves
     # by object id, so it scores 100 and is never held back by this check.
-    $matchType = if ($useExcel) { $IdentifierType } else { 'ObjectId' }
+    # A user the operator picked is confirmed by object id, so it scores 100 and
+    # is never held back by -MinMatchScore (the human pick is the stronger check).
+    $matchType = if ($useExcel -and -not $picked) { $IdentifierType } else { 'ObjectId' }
     $match = Get-MatchScore -Value $value -Users $users -Type $matchType -Provider $provider
     $score = [int]$match.Score
     $script:LastMatchScore = $score

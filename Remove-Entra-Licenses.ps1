@@ -325,6 +325,25 @@ function Get-MatchScore {
     return $result
 }
 
+function Select-CloseMatch {
+    <# Shows the numbered close-name candidates for one unresolved row and returns
+       the candidate the operator picks, or $null when the prompt is skipped with
+       Enter. Mirrors the picker in add_or_move_Entra-Users.ps1. #>
+    param([object[]]$Matches, [string]$Value)
+    $list = @($Matches | Where-Object { $_ })
+    if ($list.Count -eq 0) { return $null }
+    Write-Host '  Closest matches:' -ForegroundColor Cyan
+    for ($n = 0; $n -lt $list.Count; $n++) {
+        $c = $list[$n]
+        Write-Host ("    [{0}] {1}  ({2})  score {3}" -f ($n + 1), $c.Name, $c.Upn, $c.Score) -ForegroundColor Gray
+    }
+    $pick = (Read-Host ("  Enter number to use that user, or press Enter to skip '{0}'" -f $Value)).Trim()
+    if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $list.Count) {
+        return $list[[int]$pick - 1]
+    }
+    return $null
+}
+
 function Get-UserId {
     param($User, [string]$Provider)
     if ($Provider -eq 'Graph') { return $User.Id }
@@ -627,16 +646,36 @@ foreach ($t in $targets) {
         $oid = $t.Id
         $disp = if ($t.Display) { $t.Display } else { $t.Identifier }
     } else {
-        $stats.NotFound++
+        $close = @()
         $closeText = 'none'
         if ($IdentifierType -ne 'ObjectId') {
             $miss = Get-MatchScore -Value $t.Identifier -Users @() -Type $IdentifierType -Provider $provider
-            $closeText = if (@($miss.CloseMatches).Count -gt 0) { (@($miss.CloseMatches | ForEach-Object { '{0} ({1}%)' -f $_.Name, $_.Score }) -join '; ') } else { 'none' }
+            $close = @($miss.CloseMatches)
+            $closeText = if ($close.Count -gt 0) { (@($close | ForEach-Object { '{0} ({1}%)' -f $_.Name, $_.Score }) -join '; ') } else { 'none' }
         }
         Write-Host (" NOT FOUND : {0}" -f $t.Identifier) -ForegroundColor DarkYellow
         if ($closeText -ne 'none') { Write-Host ("  closest  : {0}" -f $closeText) -ForegroundColor DarkGray }
-        Write-Log -Action 'Resolve' -Identifier $t.Identifier -DisplayName '' -UserId '' -Sku '' -Result 'NotFound' -Message ("No matching Entra user. Closest: {0}" -f $closeText)
-        continue
+
+        # --- Close-match picker -------------------------------------------
+        # Nothing resolved. Offer the closest names by number so the operator
+        # can confirm the intended user. Pressing Enter skips the row.
+        $chosen = $null
+        if ($useExcel -and $IdentifierType -ne 'ObjectId' -and $close.Count -gt 0) {
+            $chosen = Select-CloseMatch -Matches $close -Value $t.Identifier
+        }
+        if ($chosen) {
+            $oid = $chosen.Id
+            $disp = $chosen.Name
+            $t.Id = $oid
+            $t.Display = $disp
+            $script:LastMatchScore = [int]$chosen.Score
+            Write-Host (" PICKED    : {0}  (chosen from close match, score {1})" -f $disp, $chosen.Score) -ForegroundColor Cyan
+            Write-Log -Action 'Resolve' -Identifier $t.Identifier -DisplayName $disp -UserId $oid -Sku '' -Result 'PickedClosest' -Message ("Chosen by operator from close match (score {0})" -f $chosen.Score)
+        } else {
+            $stats.NotFound++
+            Write-Log -Action 'Resolve' -Identifier $t.Identifier -DisplayName '' -UserId '' -Sku '' -Result 'NotFound' -Message ("No matching Entra user. Closest: {0}" -f $closeText)
+            continue
+        }
     }
     $stats.Processed++
     $skus = if ($t.Skus) { $t.Skus } else { @(Get-UserSkuIds -UserId $oid -Provider $provider) }

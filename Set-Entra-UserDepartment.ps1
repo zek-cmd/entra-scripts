@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     Manually type a user's name and set the account's Office / Department to
-    "Provision Fix". Works on one user, or on a list you paste in.
+    "Provision Fix". Works on one user per run.
 
 .DESCRIPTION
     You type a name (or part of a name, or a sign-in name / email). The script
@@ -23,8 +23,9 @@
       * Spelling differences are scored with letter edits, so small typos still show.
       * Results are ranked 0-100 and shown as a numbered list you pick from.
 
-    If nothing matches, you can pick any of the suggestions, or the script asks
-    again - it never guesses by itself.
+    If nothing matches, you can pick any of the suggestions, or type the name
+    again for that same user - it never guesses by itself, and it never moves on
+    to a second user, so nothing piles up in a queue.
 
 .PARAMETER User
     A name, sign-in name (UPN) or email. If omitted, the script asks for it.
@@ -343,24 +344,20 @@ Write-Host (' Command it runs  : Update-MgUser -UserId "<sign-in name>" -Departm
 
 $stats = [ordered]@{ Changed = 0; Already = 0; Skipped = 0; Failed = 0; WhatIf = 0 }
 
-# One name from the command line, otherwise ask in a loop so several users can be done.
+# One name only. From the command line if given, otherwise asked once here -
+# nothing is queued up, so each run works on a single user.
 $queue = @()
 if (-not [string]::IsNullOrWhiteSpace($User)) {
     $queue = @($User)
 } else {
     Write-Host ''
     Write-Host ' Type a name, part of a name, or a sign-in name / email.' -ForegroundColor Gray
-    Write-Host ' Leave it blank and press Enter when you are finished.' -ForegroundColor DarkGray
-    while ($true) {
-        $typed = (Read-Host ' User name').Trim()
-        if ($typed -eq '') { break }
-        $queue += $typed
-        Write-Host (' {0} name(s) queued.' -f $queue.Count) -ForegroundColor DarkGray
-    }
-    if ($queue.Count -eq 0) {
+    $typed = (Read-Host ' User name').Trim()
+    if ($typed -eq '') {
         Write-Host ' Nothing entered. Nothing to do.' -ForegroundColor Yellow
         return
     }
+    $queue = @($typed)
 }
 
 foreach ($typedName in $queue) {
